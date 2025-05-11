@@ -24,4 +24,17 @@
 vendor/
 
 # Go workspace file
-go.work 
+go.work
+
+# Temporary files
+temp/
+
+# Logs
+logs/
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo 
