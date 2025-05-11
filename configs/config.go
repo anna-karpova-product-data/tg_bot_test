@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	TelegramToken string
+	DeepgramToken string
 	IsDev         bool
 }
 
@@ -26,6 +27,7 @@ func LoadConfig() (*Config, error) {
 
 	return &Config{
 		TelegramToken: os.Getenv("TELEGRAM_TOKEN"),
+		DeepgramToken: os.Getenv("DEEPGRAM_TOKEN"),
 		IsDev:         isDev,
 	}, nil
 }

@@ -1,20 +1,28 @@
 package bot
 
 import (
+	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"tg_bot/internal/speech"
 )
 
 type Bot struct {
 	api *tgbotapi.BotAPI
 	// Map to store conversation states
 	conversationStates map[int64]string
+	// Speech recognition client
+	speechClient *speech.DeepgramClient
 }
 
-func New(token string) (*Bot, error) {
-	api, err := tgbotapi.NewBotAPI(token)
+func New(telegramToken, deepgramToken string) (*Bot, error) {
+	api, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		return nil, err
 	}
@@ -22,6 +30,7 @@ func New(token string) (*Bot, error) {
 	return &Bot{
 		api:                api,
 		conversationStates: make(map[int64]string),
+		speechClient:       speech.NewDeepgramClient(deepgramToken),
 	}, nil
 }
 
@@ -42,6 +51,7 @@ func analyzeMood(text string) string {
 		"в хорошем настроении", "в отличном настроении",
 		"в прекрасном настроении", "в чудесном настроении",
 		"в восхитительном настроении", "в потрясающем настроении",
+		"хорошо", "хорошая", "хороший", "хорошее",
 	}
 
 	// Negative mood indicators
@@ -185,10 +195,154 @@ func (b *Bot) Run() error {
 			continue
 		}
 
+		chatID := update.Message.Chat.ID
+		state := b.conversationStates[chatID]
+
+		// Handle voice messages
+		if update.Message.Voice != nil {
+			log.Printf("Received voice message from user %d", chatID)
+			
+			// Download the voice message
+			voice := update.Message.Voice
+			file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: voice.FileID})
+			if err != nil {
+				log.Printf("Error getting file: %v", err)
+				continue
+			}
+			log.Printf("Got file info: %+v", file)
+
+			// Create temp directory if it doesn't exist
+			if err := os.MkdirAll("temp", 0755); err != nil {
+				log.Printf("Error creating temp directory: %v", err)
+				continue
+			}
+
+			// Download the file
+			resp, err := http.Get(file.Link(b.api.Token))
+			if err != nil {
+				log.Printf("Error downloading file: %v", err)
+				continue
+			}
+			defer resp.Body.Close()
+			log.Printf("Downloaded file successfully")
+
+			// Save the file
+			audioPath := filepath.Join("temp", fmt.Sprintf("%s.ogg", voice.FileID))
+			out, err := os.Create(audioPath)
+			if err != nil {
+				log.Printf("Error creating file: %v", err)
+				continue
+			}
+			defer out.Close()
+
+			_, err = io.Copy(out, resp.Body)
+			if err != nil {
+				log.Printf("Error saving file: %v", err)
+				continue
+			}
+			log.Printf("Saved file to %s", audioPath)
+
+			// Log file info
+			fileInfo, err := os.Stat(audioPath)
+			if err != nil {
+				log.Printf("Error getting file info: %v", err)
+			} else {
+				log.Printf("Audio file size: %d bytes", fileInfo.Size())
+			}
+
+			// Convert OGG to WAV
+			wavPath, err := speech.ConvertOggToWav(audioPath)
+			if err != nil {
+				log.Printf("Error converting audio: %v", err)
+				continue
+			}
+			defer speech.CleanupAudioFiles(audioPath, wavPath)
+			log.Printf("Converted to WAV: %s", wavPath)
+
+			// Transcribe the audio
+			text, err := b.speechClient.TranscribeAudio(wavPath)
+			if err != nil {
+				log.Printf("Error transcribing audio: %v", err)
+				msg := tgbotapi.NewMessage(chatID, "Извините, не удалось распознать голосовое сообщение.")
+				if _, err := b.api.Send(msg); err != nil {
+					log.Printf("Error sending message: %v", err)
+				}
+				continue
+			}
+			log.Printf("Transcribed text: %s", text)
+
+			// Send the transcribed text back to the user
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Распознанный текст: %s", text))
+			if _, err := b.api.Send(msg); err != nil {
+				log.Printf("Error sending transcribed text: %v", err)
+			}
+
+			// Process the transcribed text as if it was a text message
+			text = strings.ToLower(text)
+			log.Printf("Processing mood for text: %s", text)
+			
+			// Анализируем настроение сразу после получения голосового сообщения
+			mood := analyzeMood(text)
+			log.Printf("Detected mood: %s", mood)
+			var response string
+
+			switch mood {
+			case "energized":
+				response = "Отлично! 💪 Такая энергия - это здорово! Держи этот настрой и используй его для достижения своих целей!"
+			case "tired":
+				response = "Сожалею, что ты сейчас устал. Давай я предложу тебе 4 упражнения, которые помогут восстановиться."
+				// Create keyboard with exercise buttons
+				var keyboard = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 1", "exercise1"),
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 2", "exercise2"),
+					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 3", "exercise3"),
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 4", "exercise4"),
+					),
+				)
+				msg := tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = keyboard
+				if _, err := b.api.Send(msg); err != nil {
+					log.Printf("Error sending tired response: %v", err)
+				}
+				continue
+			case "positive":
+				response = "Рад слышать, что у тебя всё хорошо! 😊 Давай сохраним это настроение!"
+			case "negative":
+				response = "Мне жаль, что тебе сейчас нелегко. Давай я предложу тебе несколько упражнений, которые помогут улучшить настроение."
+				// Create keyboard with exercise buttons
+				var keyboard = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 1", "exercise1"),
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 2", "exercise2"),
+					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 3", "exercise3"),
+						tgbotapi.NewInlineKeyboardButtonData("Упражнение 4", "exercise4"),
+					),
+				)
+				msg := tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = keyboard
+				if _, err := b.api.Send(msg); err != nil {
+					log.Printf("Error sending negative response: %v", err)
+				}
+				continue
+			default:
+				response = "Понятно. Как я могу тебе помочь?"
+			}
+
+			msg = tgbotapi.NewMessage(chatID, response)
+			if _, err := b.api.Send(msg); err != nil {
+				log.Printf("Error sending final response: %v", err)
+			}
+			continue
+		}
+
+		// Handle text messages
 		if !update.Message.IsCommand() {
 			text := strings.ToLower(update.Message.Text)
-			chatID := update.Message.Chat.ID
-			state := b.conversationStates[chatID]
 
 			switch {
 			case strings.Contains(text, "привет") && state == "":

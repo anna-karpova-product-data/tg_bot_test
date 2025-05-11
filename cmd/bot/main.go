@@ -13,7 +13,7 @@ func main() {
 		log.Fatalf("Error loading config: %v", err)
 	}
 
-	b, err := bot.New(cfg.TelegramToken)
+	b, err := bot.New(cfg.TelegramToken, cfg.DeepgramToken)
 	if err != nil {
 		log.Fatalf("Error creating bot: %v", err)
 	}
